@@ -1,1 +1,6 @@
-﻿.env
+.next/
+node_modules/
+.env.local
+backedned/.env
+backedned/__pycache__/
+backedned/training/__pycache__/
