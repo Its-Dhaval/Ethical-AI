@@ -84,8 +84,12 @@ data/audio/
 ### Train image model
 
 ```bash
-python train_image.py --data_dir data/image --output models/image_detector.pth --epochs 8
+python train_image.py --data_dir data/image --output models/image_detector.pth --epochs 30 --backbone efficientnet_b0 --group_by stem
 ```
+
+This now also saves:
+- `models/image_validation_scores.jsonl` (validation component scores)
+- `models/image_ensemble_weights.json` (calibrated ensemble weights + threshold)
 
 ### Train audio model
 

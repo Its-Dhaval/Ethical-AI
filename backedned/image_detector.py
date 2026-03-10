@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 from dataclasses import dataclass
@@ -6,10 +7,11 @@ from typing import List, Optional
 import cv2
 import numpy as np
 import torch
-import torch.nn as nn
 from huggingface_hub import InferenceClient
 from PIL import Image
-from torchvision import models, transforms
+from torchvision import transforms
+
+from training.models import ImageBinaryClassifier, default_img_size_for_backbone
 
 
 @dataclass
@@ -29,80 +31,137 @@ class ImagePrediction:
     model_results: List[ModelScore]
 
 
-class BinaryResNet18(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.backbone = models.resnet18(weights=None)
-        in_features = self.backbone.fc.in_features
-        self.backbone.fc = nn.Linear(in_features, 1)
-
-    def forward(self, x):
-        return self.backbone(x)
-
-
 class ImageDeepfakeDetector:
-    def __init__(self, model_path: str = "models/image_detector.pth", device: str = None):
+    def __init__(
+        self,
+        model_path: str = "models/image_detector.pth",
+        ensemble_path: Optional[str] = None,
+        device: Optional[str] = None,
+    ):
         self.model_path = model_path
+        self.ensemble_path = ensemble_path
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.fake_threshold = 0.45
+
+        # Default values are replaced by checkpoint metadata/calibration files when present.
+        self.fake_threshold = 0.5
+        self.backbone = "efficientnet_b0"
+        self.img_size = 320
+        self.custom_model: Optional[torch.nn.Module] = None
 
         self.hf_model_id = "prithivMLmods/Deep-Fake-Detector-v2-Model"
         self.hf_display_name = "Deep-Fake-Detector-v2-Model"
 
         self.model_weights = {
-            "custom_resnet_binary": 0.30,
-            "resnet_uncertainty": 0.15,
-            "efficientnet_uncertainty": 0.15,
+            "custom_model_score": 0.55,
             "texture_artifact_score": 0.10,
             "frequency_artifact_score": 0.10,
-            "face_region_score": 0.20,
-            # Give higher influence to the HF deepfake model.
-            "Deep-Fake-Detector-v2-Model": 0.55,
+            "face_region_score": 0.25,
+            "Deep-Fake-Detector-v2-Model": 0.35,
         }
 
         self.preprocess = transforms.Compose(
             [
-                transforms.Resize((224, 224)),
+                transforms.Resize((self.img_size, self.img_size)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ]
         )
 
-        self.custom_model = None
-        self.resnet_model = None
-        self.efficientnet_model = None
         self.face_detector = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
 
         self.hf_client = None
         self.hf_ready = False
-        self._load_models()
+
+        self._load_custom_model()
+        self._load_ensemble_calibration()
         self._init_hf_client()
 
-    def _load_models(self):
-        try:
-            self.resnet_model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        except Exception:
-            self.resnet_model = models.resnet18(weights=None)
-        self.resnet_model.to(self.device).eval()
+    def _init_preprocess(self):
+        self.preprocess = transforms.Compose(
+            [
+                transforms.Resize((self.img_size, self.img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
 
-        try:
-            self.efficientnet_model = models.efficientnet_b0(
-                weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1
-            )
-        except Exception:
-            self.efficientnet_model = models.efficientnet_b0(weights=None)
-        self.efficientnet_model.to(self.device).eval()
+    def _load_custom_model(self):
+        if not os.path.exists(self.model_path):
+            return
 
-        if os.path.exists(self.model_path):
-            model = BinaryResNet18().to(self.device)
-            checkpoint = torch.load(self.model_path, map_location=self.device)
-            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-                checkpoint = checkpoint["state_dict"]
-            model.load_state_dict(checkpoint, strict=False)
-            model.eval()
-            self.custom_model = model
+        checkpoint = torch.load(self.model_path, map_location=self.device)
+        state_dict = checkpoint
+        meta = {}
+        if isinstance(checkpoint, dict):
+            state_dict = checkpoint.get("state_dict", checkpoint)
+            meta = checkpoint.get("meta", {}) or {}
+
+        backbone = str(meta.get("backbone", "")).strip()
+        if not backbone:
+            backbone = self._infer_backbone_from_state_dict(state_dict)
+
+        img_size_meta = meta.get("img_size")
+        if isinstance(img_size_meta, (int, float)):
+            img_size = int(img_size_meta)
+        else:
+            img_size = default_img_size_for_backbone(backbone)
+        decision_threshold = meta.get("decision_threshold")
+
+        model = ImageBinaryClassifier(backbone=backbone, pretrained=False).to(self.device)
+        model.load_state_dict(state_dict, strict=False)
+        model.eval()
+
+        self.custom_model = model
+        self.backbone = backbone
+        self.img_size = img_size
+        if isinstance(decision_threshold, (int, float)) and 0.0 < float(decision_threshold) < 1.0:
+            self.fake_threshold = float(decision_threshold)
+
+        self._init_preprocess()
+
+    def _infer_backbone_from_state_dict(self, state_dict) -> str:
+        if not isinstance(state_dict, dict):
+            return self.backbone
+        keys = list(state_dict.keys())
+        if any(k.startswith("backbone.features.") for k in keys):
+            if any(".6." in k for k in keys):
+                return "efficientnet_v2_s"
+            return "efficientnet_b0"
+        if any(k.startswith("backbone.layer4.2.") for k in keys):
+            return "resnet50"
+        if any(k.startswith("backbone.layer4.1.") for k in keys):
+            return "resnet18"
+        if any(k.startswith("backbone.stages.") for k in keys):
+            return "convnext_tiny"
+        return self.backbone
+
+    def _load_ensemble_calibration(self):
+        candidates = []
+        if self.ensemble_path:
+            candidates.append(self.ensemble_path)
+        base_dir = os.path.dirname(self.model_path) or "."
+        candidates.append(os.path.join(base_dir, "image_ensemble_weights.json"))
+        candidates.append(os.path.join(base_dir, "ensemble_weights.json"))
+
+        for path in candidates:
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                loaded_weights = payload.get("weights", {})
+                if isinstance(loaded_weights, dict):
+                    for k, v in loaded_weights.items():
+                        if isinstance(v, (int, float)):
+                            self.model_weights[str(k)] = float(v)
+                threshold = payload.get("threshold")
+                if isinstance(threshold, (int, float)) and 0.0 < float(threshold) < 1.0:
+                    self.fake_threshold = float(threshold)
+                break
+            except Exception:
+                continue
 
     def _init_hf_client(self):
         try:
@@ -131,24 +190,18 @@ class ImageDeepfakeDetector:
     def _tensor_from_pil(self, image: Image.Image) -> torch.Tensor:
         return self.preprocess(image).unsqueeze(0).to(self.device)
 
-    def _softmax_uncertainty_fake_score(self, logits: torch.Tensor) -> float:
-        probs = torch.softmax(logits, dim=1)
-        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1)
-        max_entropy = np.log(probs.shape[1])
-        return float((entropy / max_entropy).item())
-
-    def _tta_uncertainty(self, model: nn.Module, image_tensor: torch.Tensor) -> float:
+    def _custom_model_score(self, image: Image.Image) -> Optional[float]:
+        if self.custom_model is None:
+            return None
+        x = self._tensor_from_pil(image)
         with torch.no_grad():
-            logits_a = model(image_tensor)
-            logits_b = model(torch.flip(image_tensor, dims=[3]))
-        score_a = self._softmax_uncertainty_fake_score(logits_a)
-        score_b = self._softmax_uncertainty_fake_score(logits_b)
-        return float((score_a + score_b) / 2.0)
+            prob = torch.sigmoid(self.custom_model(x)).item()
+        return float(np.clip(prob, 0.0, 1.0))
 
     def _texture_score(self, rgb: np.ndarray) -> float:
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        return 1.0 - float(np.clip(lap_var / 400.0, 0.0, 1.0))
+        return float(1.0 - np.clip(lap_var / 400.0, 0.0, 1.0))
 
     def _frequency_score(self, rgb: np.ndarray) -> float:
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
@@ -185,14 +238,13 @@ class ImageDeepfakeDetector:
         y2 = min(rgb.shape[0], y + h + pad)
         return rgb[y1:y2, x1:x2]
 
-    def _face_region_score(self, face_rgb: np.ndarray) -> float:
-        face_img = Image.fromarray(face_rgb)
-        face_tensor = self._tensor_from_pil(face_img)
-        resnet_score = self._tta_uncertainty(self.resnet_model, face_tensor)
-        eff_score = self._tta_uncertainty(self.efficientnet_model, face_tensor)
-        texture_score = self._texture_score(face_rgb)
-        frequency_score = self._frequency_score(face_rgb)
-        return float(np.mean([resnet_score, eff_score, texture_score, frequency_score]))
+    def _face_region_score(self, face_rgb: np.ndarray, tex_score: float, freq_score: float) -> float:
+        if face_rgb is not None and face_rgb.size > 0 and self.custom_model is not None:
+            face_img = Image.fromarray(face_rgb)
+            face_score = self._custom_model_score(face_img)
+            if face_score is not None:
+                return float(face_score)
+        return float((tex_score + freq_score) * 0.5)
 
     def _extract_hf_fake_probability(self, output) -> Optional[float]:
         if not output:
@@ -254,35 +306,24 @@ class ImageDeepfakeDetector:
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        image_tensor = self._tensor_from_pil(image)
         rgb = np.array(image)
         model_scores: List[ModelScore] = []
 
-        if self.custom_model is not None:
-            with torch.no_grad():
-                logit = self.custom_model(image_tensor).squeeze()
-                custom_fake = float(torch.sigmoid(logit).item())
-            model_scores.append(ModelScore("custom_resnet_binary", round(custom_fake, 4)))
+        custom_score = self._custom_model_score(image)
+        if custom_score is not None:
+            model_scores.append(ModelScore("custom_model_score", round(custom_score, 4)))
 
-        model_scores.append(
-            ModelScore("resnet_uncertainty", round(self._tta_uncertainty(self.resnet_model, image_tensor), 4))
-        )
-        model_scores.append(
-            ModelScore(
-                "efficientnet_uncertainty",
-                round(self._tta_uncertainty(self.efficientnet_model, image_tensor), 4),
-            )
-        )
-        model_scores.append(ModelScore("texture_artifact_score", round(self._texture_score(rgb), 4)))
-        model_scores.append(ModelScore("frequency_artifact_score", round(self._frequency_score(rgb), 4)))
+        tex_score = self._texture_score(rgb)
+        freq_score = self._frequency_score(rgb)
+        model_scores.append(ModelScore("texture_artifact_score", round(tex_score, 4)))
+        model_scores.append(ModelScore("frequency_artifact_score", round(freq_score, 4)))
 
         face_crop = self._detect_largest_face(rgb)
-        if face_crop is not None and face_crop.size > 0:
-            model_scores.append(ModelScore("face_region_score", round(self._face_region_score(face_crop), 4)))
+        face_score = self._face_region_score(face_crop, tex_score, freq_score)
+        model_scores.append(ModelScore("face_region_score", round(face_score, 4)))
 
         hf_error = None
         hf_scored = False
-        hf_score = None
         if include_hf:
             hf_score, hf_error = self._hf_image_score(image)
             if hf_score is not None:
@@ -298,21 +339,16 @@ class ImageDeepfakeDetector:
             weighted_sum += item.fake_probability * w
             total_weight += w
 
-        fake_prob = weighted_sum / total_weight if total_weight > 0 else float(
-            np.mean([m.fake_probability for m in model_scores])
-        )
+        if total_weight > 0:
+            fake_prob = weighted_sum / total_weight
+        else:
+            fake_prob = float(np.mean([m.fake_probability for m in model_scores]))
         fake_prob = float(np.clip(fake_prob, 0.0, 1.0))
-
-        strong_fake = sum(1 for m in model_scores if m.fake_probability >= 0.60)
-        very_strong_fake = any(m.fake_probability >= 0.75 for m in model_scores)
-        if strong_fake >= 2:
-            fake_prob = max(fake_prob, 0.55)
-        if very_strong_fake:
-            fake_prob = max(fake_prob, 0.62)
 
         real_prob = 1.0 - fake_prob
         label = "Fake" if fake_prob >= self.fake_threshold else "Real"
-        confidence = abs(fake_prob - 0.5) * 2.0
+        confidence = abs(fake_prob - self.fake_threshold) / max(self.fake_threshold, 1.0 - self.fake_threshold, 1e-6)
+        confidence = float(np.clip(confidence, 0.0, 1.0))
 
         details = {
             "num_models_used": len(model_scores),
@@ -320,6 +356,8 @@ class ImageDeepfakeDetector:
             "weights_used": {m.model_name: self._weight_for_model(m.model_name) for m in model_scores},
             "face_detected": face_crop is not None,
             "decision_threshold": self.fake_threshold,
+            "backbone": self.backbone,
+            "img_size": self.img_size,
             "hf_model": self.hf_model_id,
             "hf_scored": hf_scored,
             "hf_error": hf_error,
@@ -330,8 +368,8 @@ class ImageDeepfakeDetector:
             label=label,
             fake_probability=round(fake_prob, 4),
             real_probability=round(real_prob, 4),
-            confidence=round(float(np.clip(confidence, 0.0, 1.0)), 4),
-            method="ensemble_weighted_average",
+            confidence=round(confidence, 4),
+            method="calibrated_weighted_ensemble",
             details=details,
             model_results=model_scores,
         )

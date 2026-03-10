@@ -5,14 +5,77 @@ from torchvision import models
 
 
 class ImageBinaryClassifier(nn.Module):
-    def __init__(self):
+    def __init__(self, backbone: str = "efficientnet_b0", pretrained: bool = True, dropout: float = 0.2):
         super().__init__()
-        self.backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        in_features = self.backbone.fc.in_features
-        self.backbone.fc = nn.Linear(in_features, 1)
+        self.backbone_name = backbone
+        self.backbone = self._build_backbone(backbone=backbone, pretrained=pretrained, dropout=dropout)
 
     def forward(self, x):
         return self.backbone(x)
+
+    def _build_backbone(self, backbone: str, pretrained: bool, dropout: float) -> nn.Module:
+        if backbone == "resnet18":
+            try:
+                weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+                model = models.resnet18(weights=weights)
+            except Exception:
+                model = models.resnet18(weights=None)
+            in_features = model.fc.in_features
+            model.fc = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(in_features, 1))
+            return model
+
+        if backbone == "resnet50":
+            try:
+                weights = models.ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
+                model = models.resnet50(weights=weights)
+            except Exception:
+                model = models.resnet50(weights=None)
+            in_features = model.fc.in_features
+            model.fc = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(in_features, 1))
+            return model
+
+        if backbone == "efficientnet_b0":
+            try:
+                weights = models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+                model = models.efficientnet_b0(weights=weights)
+            except Exception:
+                model = models.efficientnet_b0(weights=None)
+            in_features = model.classifier[-1].in_features
+            model.classifier[-1] = nn.Linear(in_features, 1)
+            return model
+
+        if backbone == "efficientnet_v2_s":
+            try:
+                weights = models.EfficientNet_V2_S_Weights.IMAGENET1K_V1 if pretrained else None
+                model = models.efficientnet_v2_s(weights=weights)
+            except Exception:
+                model = models.efficientnet_v2_s(weights=None)
+            in_features = model.classifier[-1].in_features
+            model.classifier[-1] = nn.Linear(in_features, 1)
+            return model
+
+        if backbone == "convnext_tiny":
+            try:
+                weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1 if pretrained else None
+                model = models.convnext_tiny(weights=weights)
+            except Exception:
+                model = models.convnext_tiny(weights=None)
+            in_features = model.classifier[-1].in_features
+            model.classifier[-1] = nn.Linear(in_features, 1)
+            return model
+
+        raise ValueError(
+            "Unsupported backbone. Use one of: "
+            "resnet18, resnet50, efficientnet_b0, efficientnet_v2_s, convnext_tiny."
+        )
+
+
+def default_img_size_for_backbone(backbone: str) -> int:
+    if backbone in {"resnet18", "resnet50", "efficientnet_b0"}:
+        return 320
+    if backbone in {"efficientnet_v2_s", "convnext_tiny"}:
+        return 384
+    return 320
 
 
 class AudioMLP(nn.Module):

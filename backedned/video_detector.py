@@ -73,7 +73,8 @@ class VideoDeepfakeDetector:
         frame_avg = float(np.mean(frame_scores))
         peak_fake = float(np.max(frame_scores))
         temporal_flicker = self._temporal_flicker_score(frame_scores)
-        majority_vote = float(np.mean([1.0 if s >= 0.5 else 0.0 for s in frame_scores]))
+        frame_threshold = float(getattr(self.image_detector, "fake_threshold", 0.5))
+        majority_vote = float(np.mean([1.0 if s >= frame_threshold else 0.0 for s in frame_scores]))
 
         model_results = [
             ModelScore("frame_average_model", round(frame_avg, 4)),
@@ -94,7 +95,7 @@ class VideoDeepfakeDetector:
         )
         fake_prob = float(np.clip(fake_prob, 0.0, 1.0))
         real_prob = 1.0 - fake_prob
-        label = "Fake" if fake_prob >= 0.5 else "Real"
+        label = "Fake" if fake_prob >= frame_threshold else "Real"
 
         std = float(np.std(frame_scores))
         base_conf = abs(fake_prob - 0.5) * 2.0

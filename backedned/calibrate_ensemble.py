@@ -19,6 +19,7 @@ def load_jsonl(path):
 def score_rows(rows, weights, threshold=0.5):
     y_true = []
     y_pred = []
+    y_prob = []
     for row in rows:
         label = int(row["label"])
         scores = row["scores"]
@@ -35,7 +36,8 @@ def score_rows(rows, weights, threshold=0.5):
         pred = 1 if prob >= threshold else 0
         y_true.append(label)
         y_pred.append(pred)
-    return y_true, y_pred
+        y_prob.append(float(prob))
+    return y_true, y_pred, y_prob
 
 
 def f1_score(y_true, y_pred):
@@ -45,6 +47,16 @@ def f1_score(y_true, y_pred):
     precision = tp / max(tp + fp, 1)
     recall = tp / max(tp + fn, 1)
     return (2 * precision * recall) / max(precision + recall, 1e-8)
+
+
+def balanced_accuracy(y_true, y_pred):
+    tp = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 1)
+    tn = sum(1 for t, p in zip(y_true, y_pred) if t == 0 and p == 0)
+    fp = sum(1 for t, p in zip(y_true, y_pred) if t == 0 and p == 1)
+    fn = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 0)
+    tpr = tp / max(tp + fn, 1)
+    tnr = tn / max(tn + fp, 1)
+    return (tpr + tnr) / 2.0
 
 
 def random_weights(keys):
@@ -58,8 +70,9 @@ def main():
     parser.add_argument("--input", type=str, required=True, help="Path to JSONL rows with label and scores")
     parser.add_argument("--output", type=str, default="models/ensemble_weights.json")
     parser.add_argument("--trials", type=int, default=4000)
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--threshold", type=float, default=None, help="If omitted, threshold is calibrated.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--optimize", choices=["f1", "balanced_acc"], default="f1")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -73,24 +86,43 @@ def main():
     if not all_keys:
         raise RuntimeError("No model score keys found in input rows.")
 
-    best_f1 = -1.0
+    best_score = -1.0
     best_weights = None
+    best_threshold = 0.5
+
     for _ in range(args.trials):
         w = random_weights(all_keys)
-        y_true, y_pred = score_rows(rows, w, threshold=args.threshold)
+        if args.threshold is None:
+            threshold = random.uniform(0.2, 0.8)
+        else:
+            threshold = args.threshold
+
+        y_true, y_pred, _ = score_rows(rows, w, threshold=threshold)
         if not y_true:
             continue
-        f1 = f1_score(y_true, y_pred)
-        if f1 > best_f1:
-            best_f1 = f1
+
+        if args.optimize == "balanced_acc":
+            metric_val = balanced_accuracy(y_true, y_pred)
+        else:
+            metric_val = f1_score(y_true, y_pred)
+
+        if metric_val > best_score:
+            best_score = metric_val
             best_weights = w
+            best_threshold = threshold
 
     if best_weights is None:
         raise RuntimeError("Could not find valid weights.")
 
+    y_true, y_pred, y_prob = score_rows(rows, best_weights, threshold=best_threshold)
+    best_f1 = f1_score(y_true, y_pred) if y_true else 0.0
+    best_bal_acc = balanced_accuracy(y_true, y_pred) if y_true else 0.0
+
     output_obj = {
-        "threshold": args.threshold,
+        "threshold": round(float(best_threshold), 6),
         "best_f1": round(best_f1, 6),
+        "best_balanced_acc": round(best_bal_acc, 6),
+        "optimize": args.optimize,
         "weights": best_weights,
     }
     with open(args.output, "w", encoding="utf-8") as f:
